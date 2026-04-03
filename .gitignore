@@ -9,3 +9,8 @@ tests/sample_video_library/*
 !tests/sample_video_library/handbrake.properties
 .idea
 jdeploy
+target/
+encoding.log
+handbrake-converted/
+handbrake.properties
+.vscode/

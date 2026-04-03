@@ -1,38 +1,54 @@
-/*
- * To change this license header, choose License Headers in Project Properties.
- * To change this template file, choose Tools | Templates
- * and open the template in the editor.
- */
-package ca.weblite.handbrake;
-
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.file.*;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.concurrent.TimeUnit;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import org.apache.tools.ant.types.Commandline;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  *
  * @author shannah
  */
 public class HandbrakeWatcher {
-    private static final String VERSION="1.0.14";
+    private static final String VERSION="1.0.15";
+
+    private static final Logger logger = Logger.getLogger(HandbrakeWatcher.class.getName());
+
     Properties props;
     File root;
     public HandbrakeWatcher(File root, Properties props) {
         this.root = root;
         this.props = props;
     }
-    
-    
+        
     private void watch() {
+
+        String logFile = getProperty("logfile", null);
+        if (logFile != null) {
+            try {
+                System.setProperty("java.util.logging.SimpleFormatter.format", "%1$tF %1$tT %4$s %2$s - %5$s%6$s%n");
+                java.util.logging.FileHandler fh = new java.util.logging.FileHandler(logFile, true);
+                fh.setFormatter(new java.util.logging.SimpleFormatter());
+                Logger.getLogger(HandbrakeWatcher.class.getName()).addHandler(fh);
+            } catch (IOException ex) {
+                Logger.getLogger(HandbrakeWatcher.class.getName()).log(Level.SEVERE, "Failed to set up logging to file "+logFile+".  Logging to console instead.", ex);
+            }
+        }
+
         while (true) {
             try {
                 crawl(root);
@@ -55,7 +71,6 @@ public class HandbrakeWatcher {
         }
         String baseName = file.getName().substring(0, file.getName().length() - sourceExt.length() -1);
         return baseName;
-        
     }
     
     private int convert(File file, String sourceExt, String destExt) throws IOException {
@@ -71,12 +86,66 @@ public class HandbrakeWatcher {
             System.out.println("The file "+file+" was modified less than 30 seconds ago.  It may still be in state of being copied to this location.  We're skipping it for now.");
             return 1;
         }
-        
+
+        ProcessBuilder ffpb = new ProcessBuilder(
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration:stream=index,codec_type,channels,bit_rate",
+                "-of", "json",
+                file.getAbsolutePath()
+        );
+
+        Process process = ffpb.start();
+        BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            sb.append(line);
+        }
+
+        Integer channels = 6;
+        Integer sourcebitRate = 99999;
+        long durationSec = 14400;
+
+        try {
+            if (process.waitFor(1, TimeUnit.SECONDS) == true && process.exitValue() == 0) {
+                // Parse JSON
+                ObjectMapper mapper = new ObjectMapper();
+                JsonNode root = mapper.readTree(sb.toString());
+
+                // Duration
+                durationSec = (long)root.path("format").path("duration").asDouble();
+
+                JsonNode streams = root.path("streams");
+                if (streams.isArray()) {
+                    for (JsonNode stream : streams) {
+                        String type = stream.path("codec_type").asText();
+                        if ("audio".equals(type)) {
+                            channels = stream.path("channels").asInt();
+                            sourcebitRate = stream.path("bit_rate").asInt(0); // default 0 if missing
+                        }
+                    }
+                }
+                } else {
+                System.err.println("Failed to use ffmpeg to get video properties.  Exit code "+process.exitValue());
+                return process.exitValue();
+            }
+        } catch (InterruptedException ex) {
+            Logger.getLogger(HandbrakeWatcher.class.getName()).log(Level.SEVERE, null, ex);
+            throw new IOException(ex);
+        }
+
         ProcessBuilder pb = new ProcessBuilder();
-        String handbrake = getProperty("handbrakecli", "HandBrakeCLI");
-        
         ArrayList<String> commands = new ArrayList<String>();
-        commands.add(handbrake);
+        String handbrake = getProperty("handbrakecli", "HandBrakeCLI");
+
+        // Allow the user to specify the handbrake command with arguments in the properties file.  E.g. "handbrakecli=/bin/flatpak run --command=HandBrakeCLI fr.handbrake.ghb" 
+        String[] parsedArgs = Commandline.translateCommandline(handbrake);
+        for (String arg : parsedArgs) {
+            commands.add(arg);
+        }
+
         Map<String, String> handbrakeOpts = new HashMap<String,String>();
         
         for (Object key : props.keySet()) {
@@ -87,17 +156,53 @@ public class HandbrakeWatcher {
         }
         
         List<String> flags = new ArrayList<String>(Arrays.asList(getProperty("handbrake.flags", "").split(" ")));
-        if (!flags.contains("--all-audio")) {
-            flags.add("--all-audio");
-        }
-        if (!handbrakeOpts.containsKey("preset")) {
-            handbrakeOpts.put("preset", "HQ 1080p30 Surround");
+
+        // Set the audio bitrate based upon the number of channels and the current bitrate for the OPUS codec.
+        // We are going assume the first audio track is the one we want and will asses based up that.
+        // Presets can be configured to choose select audio tracks and we will assume the first track channel configuraiton.
+        Integer bitRateInt = 256;
+        if (channels != null) {
+            if (channels == 6) {
+                if (sourcebitRate <= 250) {
+                    bitRateInt =  sourcebitRate;
+                } else {
+                    bitRateInt = 256;
+                }
+            } else if (channels == 2) {
+                if (sourcebitRate <= 122) {
+                    bitRateInt =  sourcebitRate;
+                } else {
+                    bitRateInt = 128;
+                }
+            } else if (channels == 8) {
+                if (sourcebitRate <= 314) {
+                    bitRateInt =  sourcebitRate;
+                } else {
+                    bitRateInt = 320;
+                }
+            } else if (channels == 1) {
+                if (sourcebitRate <= 90) {
+                    bitRateInt =  sourcebitRate;
+                } else {
+                    bitRateInt = 96;
+                }
+            }
+            commands.add("-B " + bitRateInt.toString());
+        } else {
+            if (!flags.contains("--all-audio")) {
+                flags.add("--all-audio");
+            }
         }
         
         flags.stream().forEach((flag) -> {
             commands.add(flag);
         });
         
+        // If the user didn't specify a preset, we'll choose a default one.       
+        if (!handbrakeOpts.containsKey("preset")) {
+            handbrakeOpts.put("preset", "HQ 1080p30 Surround");
+        }
+
         handbrakeOpts.keySet().stream().forEach((key) -> {
             commands.add("--"+key);
             commands.add(handbrakeOpts.get(key));
@@ -107,20 +212,34 @@ public class HandbrakeWatcher {
         commands.add(file.getAbsolutePath());
         commands.add("-o");
         commands.add(destFile.getAbsolutePath());
-        
+
         pb.command(commands);
         pb.inheritIO();
         
+        logger.log(Level.INFO, "Starting encoding of file "+file);
         Process p = pb.start();
         try {
-            if (p.waitFor() == 0) {
+            if (p.waitFor(durationSec*2, TimeUnit.SECONDS) == true && p.exitValue() == 0) {
                 // The conversion was successful
                 // Let's delete the original
+                logger.log(Level.INFO, "SUCCESSFULLY completed encoding of file "+file);
                 if (getProperty("delete_original", "true").equals("true")) {
                     file.delete();
                 }
+                else if (getProperty("move_original", "false").equals("true")) {
+                    File moveFile = new File(getMoveDirectoryFor(root, true), file.getName());
+                    Path sourcePath = Paths.get(file.getAbsolutePath());
+                    Path targetPath = Paths.get(moveFile.getAbsolutePath());
+                    try {
+                        Files.move(sourcePath,targetPath, StandardCopyOption.REPLACE_EXISTING);   
+                    } catch (IOException e) {
+                        System.err.println("Move failed: " + e.getMessage());
+                    }
+                }
             } else {
                 System.err.println("Failed to convert file "+file+" to "+destFile+".  Exit code "+p.exitValue());
+                logger.log(Level.INFO, "FAILED encoding of file "+file);
+                p.destroy();
                 // We'll delete the destFile because, if it failed, we don't want it
                 if (destFile.exists()) {
                     destFile.delete();
@@ -145,9 +264,19 @@ public class HandbrakeWatcher {
         }
 
         try {
-            destinationDirectory = destinationDirectory.replace("${src.dir}", file.getParentFile().getCanonicalPath());
+            File out;
+            if (destinationDirectory.contains("${src.dir}")) {
+                destinationDirectory = destinationDirectory.replace("${src.dir}", file.getParentFile().getCanonicalPath());
+                out = new File(destinationDirectory);
+            } else {
+                // Replicate the folder structure relative to the root watch folder
+                Path rootPath = root.getCanonicalFile().toPath();
+                Path fileDirPath = file.getParentFile().getCanonicalFile().toPath();
+                Path relativePath = rootPath.relativize(fileDirPath);
+                File destBase = new File(destinationDirectory);
+                out = relativePath.toString().isEmpty() ? destBase : new File(destBase, relativePath.toString());
+            }
 
-            File out = new File(destinationDirectory);
             if (mkdirs && !out.exists()) {
                 boolean mkdirSuccess = out.mkdirs();
                 if (!mkdirSuccess) {
@@ -167,7 +296,37 @@ public class HandbrakeWatcher {
         }
 
     }
-    
+
+    private File getMoveDirectoryFor(File file, boolean mkdirs) {
+        String moveDirectory = getProperty("move.dir", null);
+        if (moveDirectory == null || moveDirectory.isEmpty()) {
+            return file.getParentFile();
+        }
+
+        try {
+//            moveDirectory = moveDirectory.replace("${src.dir}", file.getParentFile().getCanonicalPath());
+
+            File out = new File(moveDirectory);
+            if (mkdirs && !out.exists()) {
+                boolean mkdirSuccess = out.mkdirs();
+                if (!mkdirSuccess) {
+                    warn("Failed to create move directory " + out + ".  Using default move directory.");
+                    return file.getParentFile();
+                }
+
+                File ignoreFile = new File(out, ".handbrake-ignore");
+                ignoreFile.createNewFile();
+            }
+
+            return out;
+
+        } catch (Exception ex) {
+            warn("move.dir was specified but an error occurred trying to parse it: " + ex.getMessage()+".");
+            return file.getParentFile();
+        }
+    }
+
+
     private void crawl(File root) {
         
         // Let's rename any autonamed titles from makemkv
@@ -282,6 +441,7 @@ public class HandbrakeWatcher {
                 props.load(fis);
             }
         }
+
         System.out.println("Handbrake Watcher v"+VERSION);
         HandbrakeWatcher watcher = new HandbrakeWatcher(watchFolder, props);
         System.out.println("Watching "+watchFolder);
@@ -345,7 +505,13 @@ public class HandbrakeWatcher {
                 + "      is akin to providing the command-line flag --preset='High Profile'\n"
                 + "      to HandbrakeCLI.\n"
                 + "  delete_original - Whether to delete the original file upon\n"
-                + "      successful conversion.  Values: true|false . Default: true";
+                + "      successful conversion.  Values: true|false . Default: true\n"
+                + "  move_original - Whether to move the original file upon\n"
+                + "      successful conversion to another directory.\n"
+                + "      Values: true|false . Default: true\n"
+                + "  mov.dir - Optional destination directory for original unconverted file\n"
+                + "      upon successful conversion."
+                + "  logfile - Optional file to log to.  Default is to log to console.\n";
         return out;
     }
     
