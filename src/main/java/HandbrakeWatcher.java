@@ -24,7 +24,7 @@ import tools.jackson.databind.ObjectMapper;
  * @author shannah
  */
 public class HandbrakeWatcher {
-    private static final String VERSION="1.0.15";
+    private static final String VERSION="1.0.19";
 
     private static final Logger logger = Logger.getLogger(HandbrakeWatcher.class.getName());
 
@@ -163,25 +163,25 @@ public class HandbrakeWatcher {
         Integer bitRateInt = 256;
         if (channels != null) {
             if (channels == 6) {
-                if (sourcebitRate <= 250) {
+                if (sourcebitRate > 0 && sourcebitRate <= 250) {
                     bitRateInt =  sourcebitRate;
                 } else {
                     bitRateInt = 256;
                 }
             } else if (channels == 2) {
-                if (sourcebitRate <= 122) {
+                if (sourcebitRate > 0 && sourcebitRate <= 122) {
                     bitRateInt =  sourcebitRate;
                 } else {
                     bitRateInt = 128;
                 }
             } else if (channels == 8) {
-                if (sourcebitRate <= 314) {
+                if (sourcebitRate > 0 && sourcebitRate <= 314) {
                     bitRateInt =  sourcebitRate;
                 } else {
                     bitRateInt = 320;
                 }
             } else if (channels == 1) {
-                if (sourcebitRate <= 90) {
+                if (sourcebitRate > 0 && sourcebitRate <= 90) {
                     bitRateInt =  sourcebitRate;
                 } else {
                     bitRateInt = 96;
@@ -412,6 +412,15 @@ public class HandbrakeWatcher {
                 }
             }
         } else if (root.isDirectory()) {
+            String dirName = root.getName();
+            if (dirName.startsWith("_UNPACK_")) {
+                System.out.println("Skipping " + root + " because folder name starts with _UNPACK_.");
+                return;
+            }
+            if (dirName.endsWith(".partial")) {
+                System.out.println("Skipping " + root + " because folder name ends with .partial.");
+                return;
+            }
             if (new File(root, ".handbrake-ignore").exists()) {
                 System.out.println("Skipping " + root + " because a .handbrake-ignore file was found.");
             }
